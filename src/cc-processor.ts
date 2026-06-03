@@ -57,7 +57,11 @@ async function streamGzipLines(
 }
 
 function normaliseDomain(d: string): string {
-  return d.toLowerCase().trim().replace(/^www\./, '');
+  return d.toLowerCase().trim()
+    .replace(/^https?:\/\//, '')  // strip protocol
+    .replace(/\/.*$/, '')          // strip path
+    .replace(/^www\./, '')         // strip www
+    .replace(/[:\s].*$/, '');      // strip port or whitespace
 }
 
 /**
