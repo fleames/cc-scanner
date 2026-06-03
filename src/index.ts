@@ -56,6 +56,7 @@ async function runScan(): Promise<void> {
       release.verticesUrl,
       release.edgesUrl,
       domains,
+      release.ranksUrl,
     );
 
     if (results.length === 0) {

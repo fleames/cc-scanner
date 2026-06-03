@@ -12,10 +12,6 @@ export interface DomainResult {
   openPageRank?: number;
 }
 
-/**
- * Streams a gzip-compressed HTTP URL line by line.
- * Calls onLine for each non-empty line. Logs progress every N lines.
- */
 // 45-minute timeout — edges file is 2–5 GB and takes several minutes to download
 const DOWNLOAD_TIMEOUT_MS = 45 * 60 * 1000;
 
@@ -60,14 +56,58 @@ async function streamGzipLines(
   return lines;
 }
 
-/**
- * Normalises a domain string:
- * - Strips www. prefix
- * - Lowercase
- * This ensures "www.example.com" matches "example.com" in watched list.
- */
 function normaliseDomain(d: string): string {
   return d.toLowerCase().replace(/^www\./, '');
+}
+
+/**
+ * Loads CC domain rank scores for our watched domains from the ranks file.
+ * Ranks file format: id TAB domain TAB rank_score  (or id TAB domain, rank in separate col)
+ * Falls back gracefully — rank data is optional enrichment.
+ *
+ * CC rank scores are harmonic centrality values; higher = more authoritative.
+ * We normalise to a 0–100 scale by mapping against the max observed score.
+ */
+async function loadRanks(
+  ranksUrl: string,
+  targetDomains: Set<string>,
+): Promise<Map<string, number>> {
+  const ranks = new Map<string, number>();
+  let maxRank = 0;
+
+  try {
+    const raw = new Map<string, number>();
+
+    await streamGzipLines(ranksUrl, 'ranks', (line) => {
+      // Format varies: "id\tdomain\tscore" or "id\tdomain" with score elsewhere
+      const parts = line.split('\t');
+      if (parts.length < 2) return;
+
+      // Last column is the score; second-to-last is the domain
+      const score  = parseFloat(parts[parts.length - 1]);
+      const domain = normaliseDomain(parts[parts.length === 2 ? 1 : parts.length - 2]);
+
+      if (!targetDomains.has(domain) || isNaN(score)) return;
+
+      raw.set(domain, score);
+      if (score > maxRank) maxRank = score;
+    });
+
+    // Normalise to 0–100 scale
+    if (maxRank > 0) {
+      for (const [domain, score] of raw) {
+        ranks.set(domain, Math.round((score / maxRank) * 100 * 10) / 10);
+      }
+    }
+
+    logger.info(`Ranks loaded for ${ranks.size} target domains`);
+  } catch (err) {
+    logger.warn('Could not load CC ranks file — skipping rank enrichment', {
+      error: String(err),
+    });
+  }
+
+  return ranks;
 }
 
 /**
@@ -77,26 +117,25 @@ function normaliseDomain(d: string): string {
  *   Pass 1: Stream vertices → build targetIdToName for watched domains
  *   Pass 2: Stream edges    → collect edges where target is a watched domain
  *   Pass 3: Stream vertices → resolve source IDs to domain names
- *   Final:  Aggregate, enrich with PageRank, return results
+ *   Ranks:  Stream ranks    → get CC authority scores for target domains
+ *   Final:  Aggregate, optionally enrich with Open PageRank, return results
  */
 export async function processRelease(
   verticesUrl: string,
   edgesUrl: string,
   watchedDomains: string[],
+  ranksUrl?: string,
 ): Promise<DomainResult[]> {
   if (watchedDomains.length === 0) {
     logger.warn('No watched domains — nothing to process');
     return [];
   }
 
-  // Normalise watched domains for matching
   const watchedSet = new Set(watchedDomains.map(normaliseDomain));
   logger.info(`Processing CC graph for ${watchedSet.size} unique domains`);
 
   // ── Pass 1: Vertices → targetIdToName ─────────────────────────────────────
   logger.info('Pass 1/3: Loading target vertices...');
-
-  // Map from vertexId (number) → original watched domain
   const targetIdToName = new Map<number, string>();
 
   await streamGzipLines(verticesUrl, 'vertices (pass 1)', (line) => {
@@ -104,9 +143,7 @@ export async function processRelease(
     if (tab < 0) return;
     const id     = parseInt(line.slice(0, tab), 10);
     const domain = normaliseDomain(line.slice(tab + 1));
-    if (watchedSet.has(domain)) {
-      targetIdToName.set(id, domain);
-    }
+    if (watchedSet.has(domain)) targetIdToName.set(id, domain);
   });
 
   logger.info(`Pass 1 complete: matched ${targetIdToName.size}/${watchedSet.size} target domains`);
@@ -120,9 +157,7 @@ export async function processRelease(
 
   // ── Pass 2: Edges → collect source→target pairs ────────────────────────────
   logger.info('Pass 2/3: Scanning edges...');
-
-  // edgesByTarget: targetId → Map<sourceId, linkCount>
-  const edgesByTarget = new Map<number, Map<number, number>>();
+  const edgesByTarget  = new Map<number, Map<number, number>>();
   const pendingSourceIds = new Set<number>();
 
   await streamGzipLines(edgesUrl, 'edges', (line) => {
@@ -131,19 +166,12 @@ export async function processRelease(
     const sourceId = parseInt(line.slice(0, tab), 10);
     const targetId = parseInt(line.slice(tab + 1), 10);
 
-    if (!targetIds.has(targetId)) return;
-
-    // Don't count self-links
-    if (sourceId === targetId) return;
+    if (!targetIds.has(targetId) || sourceId === targetId) return;
 
     pendingSourceIds.add(sourceId);
-
-    let sourceMap = edgesByTarget.get(targetId);
-    if (!sourceMap) {
-      sourceMap = new Map();
-      edgesByTarget.set(targetId, sourceMap);
-    }
-    sourceMap.set(sourceId, (sourceMap.get(sourceId) ?? 0) + 1);
+    let sm = edgesByTarget.get(targetId);
+    if (!sm) { sm = new Map(); edgesByTarget.set(targetId, sm); }
+    sm.set(sourceId, (sm.get(sourceId) ?? 0) + 1);
   });
 
   logger.info(`Pass 2 complete`, {
@@ -153,51 +181,52 @@ export async function processRelease(
 
   // ── Pass 3: Vertices → resolve source IDs ─────────────────────────────────
   logger.info('Pass 3/3: Resolving source domain names...');
-
   const sourceIdToName = new Map<number, string>();
 
   await streamGzipLines(verticesUrl, 'vertices (pass 3)', (line) => {
     const tab = line.indexOf('\t');
     if (tab < 0) return;
     const id = parseInt(line.slice(0, tab), 10);
-    if (pendingSourceIds.has(id)) {
-      sourceIdToName.set(id, normaliseDomain(line.slice(tab + 1)));
-    }
+    if (pendingSourceIds.has(id)) sourceIdToName.set(id, normaliseDomain(line.slice(tab + 1)));
   });
 
   logger.info(`Pass 3 complete: resolved ${sourceIdToName.size}/${pendingSourceIds.size} source IDs`);
 
-  // ── Aggregate results ──────────────────────────────────────────────────────
+  // ── Aggregate ──────────────────────────────────────────────────────────────
   logger.info('Aggregating results...');
-
   const rawResults: Array<{ domain: string; sources: Map<string, number> }> = [];
 
   for (const [targetId, sourceMap] of edgesByTarget) {
     const targetDomain = targetIdToName.get(targetId);
     if (!targetDomain) continue;
 
-    // Aggregate link counts by source domain name
-    const bySourceDomain = new Map<string, number>();
+    const bySource = new Map<string, number>();
     for (const [sourceId, count] of sourceMap) {
-      const sourceDomain = sourceIdToName.get(sourceId);
-      if (!sourceDomain || sourceDomain === targetDomain) continue;
-      bySourceDomain.set(sourceDomain, (bySourceDomain.get(sourceDomain) ?? 0) + count);
+      const src = sourceIdToName.get(sourceId);
+      if (!src || src === targetDomain) continue;
+      bySource.set(src, (bySource.get(src) ?? 0) + count);
     }
-
-    rawResults.push({ domain: targetDomain, sources: bySourceDomain });
+    rawResults.push({ domain: targetDomain, sources: bySource });
   }
 
-  // ── Open PageRank enrichment ───────────────────────────────────────────────
-  const targetDomains = rawResults.map(r => r.domain);
-  const pageRanks     = await getPageRanks(targetDomains);
+  // ── Rank enrichment: CC ranks file first, Open PageRank as fallback ────────
+  const targetDomainNames = rawResults.map(r => r.domain);
+  let ccRanks = new Map<string, number>();
+  let oprRanks = new Map<string, number>();
 
-  if (pageRanks.size > 0) {
-    logger.info(`PageRank enriched ${pageRanks.size} domains`);
+  if (ranksUrl) {
+    ccRanks = await loadRanks(ranksUrl, new Set(targetDomainNames));
+  }
+
+  // Only call Open PageRank API for domains the CC ranks file didn't cover
+  const needsOpr = targetDomainNames.filter(d => !ccRanks.has(d));
+  if (needsOpr.length > 0) {
+    oprRanks = await getPageRanks(needsOpr);
+    if (oprRanks.size > 0) logger.info(`OPR enriched ${oprRanks.size} domains`);
   }
 
   // ── Build final output ────────────────────────────────────────────────────
   const results: DomainResult[] = rawResults.map(({ domain, sources }) => {
-    // Sort by link count descending, take top N
     const sorted = [...sources.entries()]
       .sort((a, b) => b[1] - a[1])
       .slice(0, config.topDomainsLimit)
@@ -207,7 +236,7 @@ export async function processRelease(
       domain,
       referringDomains: sorted,
       totalReferringDomains: sources.size,
-      openPageRank: pageRanks.get(domain),
+      openPageRank: ccRanks.get(domain) ?? oprRanks.get(domain),
     };
   });
 
