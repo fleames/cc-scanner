@@ -75,6 +75,27 @@ function unreverse(d: string): string {
 const KNOWN_TLDS = new Set(['com', 'org', 'net', 'edu', 'gov', 'io', 'co', 'uk',
   'de', 'fr', 'nl', 'ru', 'jp', 'cn', 'br', 'au', 'ca', 'it', 'es', 'pl']);
 
+// Known 2-part TLDs where the registered domain has 3 labels (e.g. example.co.uk)
+const TWO_PART_TLDS = new Set([
+  'co.uk', 'co.jp', 'co.nz', 'co.za', 'co.id', 'co.kr', 'co.in',
+  'com.au', 'com.br', 'com.cn', 'com.mx', 'com.ar', 'com.tr',
+  'org.uk', 'net.au', 'ac.uk', 'me.uk',
+]);
+
+/**
+ * Extracts the eTLD+1 (registered domain) from a hostname.
+ * blog.example.com → example.com
+ * blog.example.co.uk → example.co.uk
+ */
+function registeredDomain(domain: string): string {
+  const parts = domain.split('.');
+  if (parts.length <= 2) return domain;
+  const lastTwo = parts.slice(-2).join('.');
+  if (TWO_PART_TLDS.has(lastTwo) && parts.length > 3) return parts.slice(-3).join('.');
+  if (TWO_PART_TLDS.has(lastTwo)) return domain;
+  return parts.slice(-2).join('.');
+}
+
 /**
  * Heuristic: if >50% of sample domain first-labels are known TLDs,
  * the file uses reversed notation (com.example instead of example.com).
@@ -168,8 +189,17 @@ export async function processRelease(
     return [];
   }
 
-  const watchedSet = new Set(watchedDomains.map(normaliseDomain));
-  logger.info(`Processing CC graph for ${watchedSet.size} unique domains`);
+  // Map from normalised domain (or its eTLD+1) → original watched domain
+  // Handles subdomains: blog.example.com → searches for example.com, stores as blog.example.com
+  const domainLookup = new Map<string, string>();
+  for (const d of watchedDomains) {
+    const norm = normaliseDomain(d);
+    const reg  = registeredDomain(norm);
+    domainLookup.set(norm, norm);
+    if (reg !== norm) domainLookup.set(reg, norm);
+  }
+  const watchedSet = new Set(domainLookup.keys());
+  logger.info(`Processing CC graph for ${domainLookup.size} unique domain keys (${watchedDomains.length} sites)`);
 
   // ── Pass 1: Vertices → targetIdToName ─────────────────────────────────────
   logger.info('Pass 1/3: Loading target vertices...');
@@ -186,19 +216,16 @@ export async function processRelease(
     const id  = parseInt(parts[0], 10);
     const raw = normaliseDomain(parts[1]);
 
-    if (watchedSet.has(raw)) {
-      targetIdToName.set(id, raw);
-    } else {
-      const flipped = normaliseDomain(unreverse(raw));
-      if (watchedSet.has(flipped)) targetIdToName.set(id, flipped);
-    }
+    const flipped = normaliseDomain(unreverse(raw));
+    const matched = domainLookup.get(raw) ?? domainLookup.get(flipped) ?? null;
+    if (matched) targetIdToName.set(id, matched);
   });
 
   // Detect storage format from samples so pass 3 applies consistently
   const isReversed = detectReversedFormat(sampleLines);
   logger.info(`Vertices format: ${isReversed ? 'reversed (com.example)' : 'normal (example.com)'}`,
     { sample: sampleLines.slice(0, 3) });
-  logger.info(`WatchedSet contents`, { watchedDomains: [...watchedSet].slice(0, 10) });
+  logger.info(`Domain lookup keys`, { keys: [...watchedSet].slice(0, 10) });
 
   logger.info(`Pass 1 complete: matched ${targetIdToName.size}/${watchedSet.size} target domains`);
 
