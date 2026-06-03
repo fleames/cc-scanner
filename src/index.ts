@@ -8,6 +8,7 @@ import {
   markRunStarted,
   markRunFailed,
   pushBacklinks,
+  sendHeartbeat,
 } from './indexaro-client';
 
 let isRunning = false;
@@ -91,6 +92,18 @@ async function runScan(): Promise<void> {
   }
 }
 
+const startedAt = Date.now();
+
+async function heartbeat(lastCrawlId: string | null = null) {
+  const uptime = Math.floor((Date.now() - startedAt) / 1000);
+  try {
+    await sendHeartbeat(lastCrawlId, uptime);
+    logger.debug('Heartbeat sent', { uptime });
+  } catch (err) {
+    logger.warn('Heartbeat failed', { error: String(err) });
+  }
+}
+
 async function main() {
   logger.info('CC Scanner starting', {
     indexaroUrl: config.indexaroUrl,
@@ -98,6 +111,12 @@ async function main() {
     topDomainsLimit: config.topDomainsLimit,
     oprEnabled: Boolean(config.oprApiKey),
   });
+
+  // Send immediate heartbeat so admin panel shows Online right away
+  await heartbeat();
+
+  // Heartbeat every 30 minutes
+  setInterval(() => heartbeat(), 30 * 60 * 1000);
 
   // Run once immediately on startup to catch up if needed
   logger.info('Running initial scan on startup...');

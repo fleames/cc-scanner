@@ -52,6 +52,13 @@ export async function markRunFailed(crawlId: string, errorMessage: string): Prom
   });
 }
 
+export async function sendHeartbeat(crawlId: string | null, uptimeSeconds: number): Promise<void> {
+  await request('/api/v1/internal/cc/heartbeat', {
+    method: 'POST',
+    body: JSON.stringify({ crawlId, uptime: uptimeSeconds }),
+  });
+}
+
 export async function pushBacklinks(crawlId: string, results: DomainResult[]): Promise<void> {
   if (results.length === 0) return;
 
