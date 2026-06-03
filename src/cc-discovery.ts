@@ -1,10 +1,7 @@
 import { logger } from './logger';
 
-// S3 REST API endpoint — required for bucket listing (CloudFront doesn't support it)
-const CC_S3_API  = 'https://commoncrawl.s3.amazonaws.com';
-// CloudFront CDN — faster for actual file downloads
-const CC_CDN     = 'https://data.commoncrawl.org';
-const GRAPH_PREFIX = 'projects/hyperlinkgraph/';
+const CC_CDN = 'https://data.commoncrawl.org';
+const GRAPH_BASE = `${CC_CDN}/projects/hyperlinkgraph`;
 
 export interface CcRelease {
   name: string;
@@ -14,96 +11,98 @@ export interface CcRelease {
 }
 
 /**
- * Lists all available CC hyperlinkgraph releases via the S3 REST API.
+ * Generates plausible CC release names from newest to oldest.
+ * CC crawls run roughly every 4-8 weeks. We probe the typical week numbers
+ * rather than trying to list the S3 bucket (listing is not publicly allowed).
  */
-async function listReleases(): Promise<string[]> {
-  const url = `${CC_S3_API}/?prefix=${GRAPH_PREFIX}&delimiter=/`;
-  logger.debug('Listing CC releases', { url });
+function generateCandidates(): string[] {
+  const candidates: string[] = [];
+  const now = new Date();
+  const currentYear = now.getFullYear();
 
-  const res = await fetch(url);
-  if (!res.ok) throw new Error(`Failed to list CC releases: ${res.status}`);
-  const xml = await res.text();
+  // CC uses these approximate week numbers across a year
+  const weeks = [51, 46, 42, 38, 33, 26, 22, 18, 13, 10, 5, 1];
 
-  logger.debug('CC S3 listing raw (first 800 chars)', { xml: xml.slice(0, 800) });
-
-  const releases: string[] = [];
-
-  // S3 XML can nest <Prefix> inside <CommonPrefixes> — match both formats
-  for (const match of xml.matchAll(/<Prefix>(projects\/hyperlinkgraph\/[^<]+)<\/Prefix>/g)) {
-    const prefix = match[1];
-    const name = prefix.replace(GRAPH_PREFIX, '').replace(/\/$/, '');
-    if (name.startsWith('cc-main-') && name !== '') {
-      releases.push(name);
+  // Check current year and 2 previous years, newest first
+  for (let year = currentYear; year >= currentYear - 2; year--) {
+    for (const week of weeks) {
+      candidates.push(`cc-main-${year}-${String(week).padStart(2, '0')}`);
     }
   }
 
-  logger.info(`Found ${releases.length} CC releases`, { releases: releases.slice(-5) });
-  return [...new Set(releases)].sort();
+  return candidates;
 }
 
 /**
- * Finds graph files for a release at a given level (domain or host).
- * Uses S3 API for listing, CDN URL for the actual download links.
+ * Probes for graph files for a given release name and level.
+ * CC has used different filename conventions across releases — tries all known patterns.
+ * Uses HEAD requests so no data is downloaded.
  */
-async function findGraphFiles(
+async function probeFiles(
   releaseName: string,
   level: 'domain' | 'host',
 ): Promise<{ verticesUrl: string; edgesUrl: string } | null> {
-  const prefix = `${GRAPH_PREFIX}${releaseName}/${level}/`;
-  const url    = `${CC_S3_API}/?prefix=${prefix}`;
+  const base = `${GRAPH_BASE}/${releaseName}/${level}`;
 
-  const res = await fetch(url);
-  if (!res.ok) return null;
-  const xml = await res.text();
+  // Known filename patterns CC has used across different releases
+  const verticesPatterns = [
+    `${releaseName}-${level}-vertices.txt.gz`,
+    `cc-main-${level}-vertices.txt.gz`,
+    `${level}-vertices.txt.gz`,
+    `vertices.txt.gz`,
+  ];
 
-  const keys: string[] = [];
-  for (const match of xml.matchAll(/<Key>([^<]+)<\/Key>/g)) {
-    keys.push(match[1]);
+  for (const vFile of verticesPatterns) {
+    const verticesUrl = `${base}/${vFile}`;
+    try {
+      const res = await fetch(verticesUrl, { method: 'HEAD' });
+      if (!res.ok) continue;
+
+      // Found vertices — construct edges URL using same naming convention
+      const eFile = vFile.replace('vertices', 'edges');
+      const edgesUrl = `${base}/${eFile}`;
+
+      // Verify edges file also exists
+      const eRes = await fetch(edgesUrl, { method: 'HEAD' });
+      if (!eRes.ok) continue;
+
+      return { verticesUrl, edgesUrl };
+    } catch {
+      // Network error on this probe — try next pattern
+    }
   }
 
-  logger.debug(`${releaseName}/${level} files`, { keys });
-
-  const verticesKey = keys.find(k => k.includes('vertices') && k.endsWith('.txt.gz'));
-  const edgesKey    = keys.find(k => k.includes('edges')    && k.endsWith('.txt.gz'));
-
-  if (!verticesKey || !edgesKey) return null;
-
-  return {
-    verticesUrl: `${CC_CDN}/${verticesKey}`,
-    edgesUrl:    `${CC_CDN}/${edgesKey}`,
-  };
+  return null;
 }
 
 /**
- * Returns the latest CC release that has graph files.
+ * Returns the latest CC release that has graph files, by probing known URL patterns.
  * Prefers domain-level (eTLD+1 aggregated); falls back to host-level.
- * Checks the last 8 releases newest-first to handle gaps.
  */
 export async function getLatestRelease(): Promise<CcRelease | null> {
-  logger.info('Discovering latest CC release...');
-  const releases = await listReleases();
+  logger.info('Discovering latest CC release (probing known URL patterns)...');
 
-  if (releases.length === 0) {
-    logger.warn('No CC releases found in S3 listing');
-    return null;
-  }
+  const candidates = generateCandidates();
+  logger.debug(`Probing ${candidates.length} candidate release names`);
 
-  for (const name of releases.slice(-8).reverse()) {
+  for (const name of candidates) {
+    logger.debug(`Probing ${name}...`);
+
     // Try domain-level first
-    const domainFiles = await findGraphFiles(name, 'domain');
+    const domainFiles = await probeFiles(name, 'domain');
     if (domainFiles) {
-      logger.info(`Using domain-level graph: ${name}`, domainFiles);
+      logger.info(`Found domain-level graph: ${name}`, domainFiles);
       return { name, ...domainFiles, level: 'domain' };
     }
 
-    // Fall back to host-level (processor normalises hostnames to domains)
-    const hostFiles = await findGraphFiles(name, 'host');
+    // Fall back to host-level
+    const hostFiles = await probeFiles(name, 'host');
     if (hostFiles) {
-      logger.info(`Using host-level graph (no domain-level available): ${name}`, hostFiles);
+      logger.info(`Found host-level graph: ${name}`, hostFiles);
       return { name, ...hostFiles, level: 'host' };
     }
   }
 
-  logger.warn('No CC release with graph files found after checking last 8 releases');
+  logger.warn('No CC release found after probing all candidates');
   return null;
 }
