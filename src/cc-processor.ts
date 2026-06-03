@@ -79,9 +79,9 @@ function detectReversedFormat(sampleLines: string[]): boolean {
   let reversed = 0;
   let total = 0;
   for (const line of sampleLines) {
-    const tab = line.indexOf('\t');
-    if (tab < 0) continue;
-    const domain = line.slice(tab + 1).trim().toLowerCase();
+    const parts = line.split('\t');
+    if (parts.length < 2) continue;
+    const domain = parts[1].trim().toLowerCase();
     const firstLabel = domain.split('.')[0];
     if (KNOWN_TLDS.has(firstLabel)) reversed++;
     total++;
@@ -114,8 +114,10 @@ async function loadRanks(
       if (parts.length < 2) return;
 
       // Last column is the score; second-to-last is the domain
-      const score  = parseFloat(parts[parts.length - 1]);
-      const raw    = normaliseDomain(parts[parts.length === 2 ? 1 : parts.length - 2]);
+      // ranks format: id TAB domain TAB score  (always take col[1] and col[2])
+      if (parts.length < 3) return;
+      const score  = parseFloat(parts[2]);
+      const raw    = normaliseDomain(parts[1]);
       const domain = isReversed ? normaliseDomain(unreverse(raw)) : raw;
 
       if (!targetDomains.has(domain) || isNaN(score)) return;
@@ -173,12 +175,13 @@ export async function processRelease(
   await streamGzipLines(verticesUrl, 'vertices (pass 1)', (line) => {
     if (sampleLines.length < 10) sampleLines.push(line);
 
-    const tab = line.indexOf('\t');
-    if (tab < 0) return;
-    const id  = parseInt(line.slice(0, tab), 10);
-    const raw = normaliseDomain(line.slice(tab + 1));
+    // Format: id TAB domain TAB extra_columns...
+    // Always split and take column [1] as the domain
+    const parts = line.split('\t');
+    if (parts.length < 2) return;
+    const id  = parseInt(parts[0], 10);
+    const raw = normaliseDomain(parts[1]);
 
-    // Try as-is first, then reversed (CC uses com.example notation)
     if (watchedSet.has(raw)) {
       targetIdToName.set(id, raw);
     } else {
@@ -230,12 +233,11 @@ export async function processRelease(
   const sourceIdToName = new Map<number, string>();
 
   await streamGzipLines(verticesUrl, 'vertices (pass 3)', (line) => {
-    const tab = line.indexOf('\t');
-    if (tab < 0) return;
-    const id = parseInt(line.slice(0, tab), 10);
+    const parts = line.split('\t');
+    if (parts.length < 2) return;
+    const id = parseInt(parts[0], 10);
     if (!pendingSourceIds.has(id)) return;
-    const raw = normaliseDomain(line.slice(tab + 1));
-    // Apply same format correction detected in pass 1
+    const raw = normaliseDomain(parts[1]);
     sourceIdToName.set(id, isReversed ? normaliseDomain(unreverse(raw)) : raw);
   });
 
