@@ -57,7 +57,36 @@ async function streamGzipLines(
 }
 
 function normaliseDomain(d: string): string {
-  return d.toLowerCase().replace(/^www\./, '');
+  return d.toLowerCase().trim().replace(/^www\./, '');
+}
+
+/**
+ * CC domain graph stores domains in reversed notation: com.example → example.com
+ * Reverse the labels back to normal order.
+ */
+function unreverse(d: string): string {
+  return d.split('.').reverse().join('.');
+}
+
+const KNOWN_TLDS = new Set(['com', 'org', 'net', 'edu', 'gov', 'io', 'co', 'uk',
+  'de', 'fr', 'nl', 'ru', 'jp', 'cn', 'br', 'au', 'ca', 'it', 'es', 'pl']);
+
+/**
+ * Heuristic: if >50% of sample domain first-labels are known TLDs,
+ * the file uses reversed notation (com.example instead of example.com).
+ */
+function detectReversedFormat(sampleLines: string[]): boolean {
+  let reversed = 0;
+  let total = 0;
+  for (const line of sampleLines) {
+    const tab = line.indexOf('\t');
+    if (tab < 0) continue;
+    const domain = line.slice(tab + 1).trim().toLowerCase();
+    const firstLabel = domain.split('.')[0];
+    if (KNOWN_TLDS.has(firstLabel)) reversed++;
+    total++;
+  }
+  return total > 0 && reversed / total > 0.5;
 }
 
 /**
@@ -71,6 +100,7 @@ function normaliseDomain(d: string): string {
 async function loadRanks(
   ranksUrl: string,
   targetDomains: Set<string>,
+  isReversed: boolean,
 ): Promise<Map<string, number>> {
   const ranks = new Map<string, number>();
   let maxRank = 0;
@@ -85,7 +115,8 @@ async function loadRanks(
 
       // Last column is the score; second-to-last is the domain
       const score  = parseFloat(parts[parts.length - 1]);
-      const domain = normaliseDomain(parts[parts.length === 2 ? 1 : parts.length - 2]);
+      const raw    = normaliseDomain(parts[parts.length === 2 ? 1 : parts.length - 2]);
+      const domain = isReversed ? normaliseDomain(unreverse(raw)) : raw;
 
       if (!targetDomains.has(domain) || isNaN(score)) return;
 
@@ -137,14 +168,29 @@ export async function processRelease(
   // ── Pass 1: Vertices → targetIdToName ─────────────────────────────────────
   logger.info('Pass 1/3: Loading target vertices...');
   const targetIdToName = new Map<number, string>();
+  const sampleLines: string[] = [];
 
   await streamGzipLines(verticesUrl, 'vertices (pass 1)', (line) => {
+    if (sampleLines.length < 10) sampleLines.push(line);
+
     const tab = line.indexOf('\t');
     if (tab < 0) return;
-    const id     = parseInt(line.slice(0, tab), 10);
-    const domain = normaliseDomain(line.slice(tab + 1));
-    if (watchedSet.has(domain)) targetIdToName.set(id, domain);
+    const id  = parseInt(line.slice(0, tab), 10);
+    const raw = normaliseDomain(line.slice(tab + 1));
+
+    // Try as-is first, then reversed (CC uses com.example notation)
+    if (watchedSet.has(raw)) {
+      targetIdToName.set(id, raw);
+    } else {
+      const flipped = normaliseDomain(unreverse(raw));
+      if (watchedSet.has(flipped)) targetIdToName.set(id, flipped);
+    }
   });
+
+  // Detect storage format from samples so pass 3 applies consistently
+  const isReversed = detectReversedFormat(sampleLines);
+  logger.info(`Vertices format: ${isReversed ? 'reversed (com.example)' : 'normal (example.com)'}`,
+    { sample: sampleLines.slice(0, 3) });
 
   logger.info(`Pass 1 complete: matched ${targetIdToName.size}/${watchedSet.size} target domains`);
 
@@ -187,7 +233,10 @@ export async function processRelease(
     const tab = line.indexOf('\t');
     if (tab < 0) return;
     const id = parseInt(line.slice(0, tab), 10);
-    if (pendingSourceIds.has(id)) sourceIdToName.set(id, normaliseDomain(line.slice(tab + 1)));
+    if (!pendingSourceIds.has(id)) return;
+    const raw = normaliseDomain(line.slice(tab + 1));
+    // Apply same format correction detected in pass 1
+    sourceIdToName.set(id, isReversed ? normaliseDomain(unreverse(raw)) : raw);
   });
 
   logger.info(`Pass 3 complete: resolved ${sourceIdToName.size}/${pendingSourceIds.size} source IDs`);
@@ -215,7 +264,7 @@ export async function processRelease(
   let oprRanks = new Map<string, number>();
 
   if (ranksUrl) {
-    ccRanks = await loadRanks(ranksUrl, new Set(targetDomainNames));
+    ccRanks = await loadRanks(ranksUrl, new Set(targetDomainNames), isReversed);
   }
 
   // Only call Open PageRank API for domains the CC ranks file didn't cover
