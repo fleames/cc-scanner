@@ -1,7 +1,7 @@
 import { logger } from './logger';
 
-const CC_CDN       = 'https://data.commoncrawl.org';
-const GRAPHINFO_URL = `${CC_CDN}/projects/hyperlinkgraph/graphinfo.json`;
+const CC_CDN        = 'https://data.commoncrawl.org';
+const GRAPHINFO_URL = 'https://index.commoncrawl.org/graphinfo.json';
 
 export interface CcRelease {
   name: string;
@@ -46,15 +46,13 @@ async function fetchReleases(): Promise<string[]> {
     ? raw
     : raw.graphs ?? raw.releases ?? raw.data ?? [];
 
+  // graphinfo.json returns newest first — preserve that order
   const names = list
     .map(entryName)
     .filter((n): n is string => typeof n === 'string' && n.startsWith('cc-main-'));
 
-  logger.info(`Found ${names.length} CC releases`, {
-    latest3: names.slice(-3),
-  });
-
-  return names.sort(); // alphabetical sort works for cc-main-YYYY-... naming
+  logger.info(`Found ${names.length} CC releases`, { latest3: names.slice(0, 3) });
+  return names;
 }
 
 /**
@@ -101,8 +99,8 @@ export async function getLatestRelease(): Promise<CcRelease | null> {
     return null;
   }
 
-  // Check newest releases first; verify files exist before committing
-  for (const name of releases.slice(-5).reverse()) {
+  // graphinfo.json is newest-first — check top 5
+  for (const name of releases.slice(0, 5)) {
     logger.debug(`Verifying domain files for ${name}`);
     const ok = await verifyDomainFiles(name);
     if (ok) {
