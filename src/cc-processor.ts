@@ -194,6 +194,7 @@ export async function processRelease(
   const isReversed = detectReversedFormat(sampleLines);
   logger.info(`Vertices format: ${isReversed ? 'reversed (com.example)' : 'normal (example.com)'}`,
     { sample: sampleLines.slice(0, 3) });
+  logger.info(`WatchedSet contents`, { watchedDomains: [...watchedSet].slice(0, 10) });
 
   logger.info(`Pass 1 complete: matched ${targetIdToName.size}/${watchedSet.size} target domains`);
 

@@ -47,6 +47,7 @@ async function runScan(): Promise<void> {
     }
 
     logger.info(`New CC release found: ${release.name}`);
+    logger.info(`Watched domains sample`, { domains: domains.slice(0, 10) });
 
     // 4. Mark run as started
     await markRunStarted(release.name);
