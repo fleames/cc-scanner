@@ -16,16 +16,33 @@ export interface DomainResult {
  * Streams a gzip-compressed HTTP URL line by line.
  * Calls onLine for each non-empty line. Logs progress every N lines.
  */
+// 45-minute timeout — edges file is 2–5 GB and takes several minutes to download
+const DOWNLOAD_TIMEOUT_MS = 45 * 60 * 1000;
+
 async function streamGzipLines(
   url: string,
   label: string,
   onLine: (line: string) => void,
 ): Promise<number> {
   logger.info(`Downloading ${label}...`, { url });
-  const res = await fetch(url);
-  if (!res.ok) throw new Error(`Failed to fetch ${label}: ${res.status}`);
 
-  const nodeStream = Readable.fromWeb(res.body as import('stream/web').ReadableStream);
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), DOWNLOAD_TIMEOUT_MS);
+
+  let res: Response;
+  try {
+    res = await fetch(url, { signal: controller.signal });
+  } catch (err) {
+    clearTimeout(timer);
+    throw new Error(`Fetch failed for ${label}: ${String(err)}`);
+  }
+  clearTimeout(timer);
+
+  if (!res.ok) throw new Error(`Failed to fetch ${label}: ${res.status}`);
+  if (!res.body) throw new Error(`No response body for ${label}`);
+
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const nodeStream = Readable.fromWeb(res.body as any);
   const gunzip    = createGunzip();
   const rl        = createInterface({ input: nodeStream.pipe(gunzip), crlfDelay: Infinity });
 
